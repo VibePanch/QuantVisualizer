@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quant-visualizer"
+version = "0.1.0"
+description = "A framework-independent model graph and quantization visualizer."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.23"]
+
+[project.optional-dependencies]
+tensorflow = ["tensorflow>=2.12"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
