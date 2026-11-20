@@ -13,6 +13,8 @@ class TensorFlowBackend(ModelBackend):
 
     def __init__(self) -> None:
         self.model: Any | None = None
+        self.interpreter: Any | None = None
+        self._tflite_details: list[dict[str, Any]] = []
         self._selected_layer_names: tuple[str, ...] = ()
 
     @staticmethod
@@ -32,16 +34,27 @@ class TensorFlowBackend(ModelBackend):
         return self.model
 
     def load_model(self, source: str | Path, **kwargs: Any) -> Any:
-        """Load a saved Keras model from a path."""
+        """Load a saved Keras model or a TensorFlow Lite flatbuffer."""
         tf = self._tensorflow()
-        self.model = tf.keras.models.load_model(str(source), **kwargs)
-        self._selected_layer_names = tuple(
-            layer.name for layer in self.model.layers
-        )
+        path = Path(source)
+        if path.suffix.lower() == ".tflite":
+            self.interpreter = tf.lite.Interpreter(model_path=str(path), **kwargs)
+            self.interpreter.allocate_tensors()
+            self._tflite_details = self.interpreter.get_tensor_details()
+            self.model = None
+            self._selected_layer_names = ()
+            return self.interpreter
+
+        self.interpreter = None
+        self._tflite_details = []
+        self.model = tf.keras.models.load_model(str(path), **kwargs)
+        self._selected_layer_names = tuple(layer.name for layer in self.model.layers)
         return self.model
 
     def get_layers(self) -> list[Any]:
         """Return Keras layers in the model's declared order."""
+        if self.interpreter is not None:
+            return self._tflite_operators()
         return list(self._require_model().layers)
 
     def build_graph(self) -> ModelGraph:
@@ -50,6 +63,8 @@ class TensorFlowBackend(ModelBackend):
         This is useful for Sequential models. Branched Functional models need
         tensor-connectivity tracing for exact graph edges.
         """
+        if self.interpreter is not None:
+            return self._build_tflite_graph()
         layers = self.get_layers()
         nodes = []
         for layer in layers:
@@ -78,10 +93,29 @@ class TensorFlowBackend(ModelBackend):
 
     def get_weights(self, layer_name: str) -> list[Any]:
         """Return NumPy weight arrays for a named layer."""
+        if self.interpreter is not None:
+            operator = next(
+                (item for item in self._tflite_operators() if item.name == layer_name),
+                None,
+            )
+            if operator is None:
+                raise KeyError(f"No TFLite operator named {layer_name!r}")
+            return [
+                self.interpreter.get_tensor(tensor_index)
+                for tensor_index in operator.metadata.get("weight_tensor_indices", [])
+            ]
         return self._get_layer(layer_name).get_weights()
 
     def set_layers(self, layer_names: Sequence[str]) -> list[Any]:
         """Set default target layers for quantization and pruning."""
+        if self.interpreter is not None:
+            available = {layer.name for layer in self._tflite_operators()}
+            names = tuple(dict.fromkeys(layer_names))
+            unknown = set(names) - available
+            if unknown:
+                raise KeyError(f"Unknown layer name(s): {', '.join(sorted(unknown))}")
+            self._selected_layer_names = names
+            return [layer for layer in self._tflite_operators() if layer.name in names]
         available = {layer.name for layer in self._require_model().layers}
         names = tuple(dict.fromkeys(layer_names))
         unknown = set(names) - available
@@ -111,6 +145,8 @@ class TensorFlowBackend(ModelBackend):
         if path.suffix.lower() != ".tflite":
             raise ValueError("TensorFlow Lite quantized models must use a .tflite path")
 
+        if self.interpreter is not None:
+            raise RuntimeError("Quantization requires a Keras model; TFLite models are visualization-only.")
         tf = self._tensorflow()
         converter = tf.lite.TFLiteConverter.from_keras_model(self._require_model())
         converter.optimizations = [tf.lite.Optimize.DEFAULT]
@@ -134,6 +170,8 @@ class TensorFlowBackend(ModelBackend):
         """Zero small-magnitude values per weight array in place."""
         if not 0.0 <= sparsity <= 1.0:
             raise ValueError("sparsity must be between 0 and 1")
+        if self.interpreter is not None:
+            raise RuntimeError("Pruning requires a Keras model; TFLite models are visualization-only.")
         import numpy as np
 
         pruned: dict[str, int] = {}
@@ -156,6 +194,8 @@ class TensorFlowBackend(ModelBackend):
 
     def export_model(self, destination: str | Path, **kwargs: Any) -> Path:
         """Save the current Keras model to the requested path."""
+        if self.interpreter is not None:
+            raise RuntimeError("Exporting TFLite models is not supported; use the original .tflite file.")
         path = Path(destination)
         self._require_model().save(str(path), **kwargs)
         return path
@@ -177,4 +217,54 @@ class TensorFlowBackend(ModelBackend):
             [self._get_layer(name) for name in names]
             if names
             else self.get_layers()
+        )
+
+    def _tflite_operators(self) -> list[Node]:
+        """Represent TFLite execution operators using the common layer interface."""
+        if self.interpreter is None:
+            return []
+        graph = self.interpreter._get_ops_details()
+        tensor_by_index = {detail["index"]: detail for detail in self._tflite_details}
+        operators = []
+        for index, operation in enumerate(graph):
+            name = f"{operation['op_name'].lower()}_{index}"
+            input_indices = operation["inputs"].tolist()
+            output_indices = operation["outputs"].tolist()
+            inputs = [tensor_by_index[i] for i in input_indices if i in tensor_by_index and i >= 0]
+            outputs = [tensor_by_index[i] for i in output_indices if i in tensor_by_index and i >= 0]
+            weight_inputs = [detail for detail in inputs if detail["index"] in input_indices[1:]]
+            parameters = sum(int(detail["shape"].prod()) for detail in weight_inputs)
+            operators.append(
+                Node(
+                    id=name,
+                    type=operation["op_name"],
+                    input_shape=[detail["shape"].tolist() for detail in inputs],
+                    output_shape=[detail["shape"].tolist() for detail in outputs],
+                    parameters=parameters,
+                    metadata={
+                        "weight_tensor_indices": [detail["index"] for detail in weight_inputs],
+                        "input_tensor_indices": input_indices,
+                        "output_tensor_indices": output_indices,
+                    },
+                )
+            )
+        return operators
+
+    def _build_tflite_graph(self) -> ModelGraph:
+        operators = self._tflite_operators()
+        producer_by_tensor = {
+            tensor_index: operator.id
+            for operator in operators
+            for tensor_index in operator.metadata["output_tensor_indices"]
+            if tensor_index >= 0
+        }
+        edges = {
+            (producer_by_tensor[tensor_index], operator.id)
+            for operator in operators
+            for tensor_index in operator.metadata["input_tensor_indices"]
+            if tensor_index in producer_by_tensor and producer_by_tensor[tensor_index] != operator.id
+        }
+        return ModelGraph(
+            nodes=operators,
+            edges=sorted(edges),
         )

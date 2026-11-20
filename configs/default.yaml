@@ -1,0 +1,11 @@
+backend: tensorflow
+
+# Run `python examples/mnist.py` to generate these files.
+examples:
+  mnist:
+    keras_model: artifacts/mnist/mnist.keras
+    tflite_model: artifacts/mnist/mnist.tflite
+    script: examples/mnist.py
+
+# Set model_path to a saved Keras model or an existing .tflite file.
+model_path: artifacts/mnist/mnist.tflite

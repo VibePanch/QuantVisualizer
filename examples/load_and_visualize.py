@@ -1,13 +1,23 @@
-"""Load a Keras model, inspect its graph, then quantize and prune weights."""
+"""Inspect a Keras or TFLite model, then optionally quantize and prune Keras."""
 
+import argparse
 from pathlib import Path
 
 from quant_visualizer.backends import TensorFlowBackend
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "model",
+        nargs="?",
+        default="path/to/saved_model.keras",
+        help="Saved .keras model or existing .tflite model to inspect",
+    )
+    args = parser.parse_args()
+
     backend = TensorFlowBackend()
-    backend.load_model("path/to/saved_model.keras")
+    backend.load_model(args.model)
 
     graph = backend.build_graph()
     print(f"Loaded {len(graph.nodes)} layers and {len(graph.edges)} edges.")
@@ -18,6 +28,10 @@ def main() -> None:
         first = graph.nodes[0].id
         for weight in backend.get_weights(first):
             print(f"{first}: shape={weight.shape}, dtype={weight.dtype}")
+
+    if Path(args.model).suffix.lower() == ".tflite":
+        print("TFLite models are ready for visualization; quantization and pruning require a Keras model.")
+        return
 
     # TFLite conversion quantizes the model as a whole; it does not target
     # individual selected layers. The default is dynamic-range quantization.
